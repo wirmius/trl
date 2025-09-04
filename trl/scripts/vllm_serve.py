@@ -465,7 +465,7 @@ def main(script_args: ScriptArguments):
         top_k: int = -1
         min_p: float = 0.0
         max_tokens: int = 16
-        guided_decoding_regex: Optional[str] = None
+        guided_decoding_kwargs: Optional[dict] = None
         generation_kwargs: dict = field(default_factory=dict)
 
     # class GenerateResponse(BaseModel):
@@ -536,8 +536,8 @@ def main(script_args: ScriptArguments):
         # logger.warning(str(starting_prompts))
         
         # Guided decoding, if enabled
-        if request.guided_decoding_regex is not None:
-            guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
+        if request.guided_decoding_kwargs is not None:
+            guided_decoding = GuidedDecodingParams(**request.guided_decoding_kwargs)
         else:
             guided_decoding = None
 
