@@ -62,6 +62,8 @@ if is_vllm_available():
     from vllm.sampling_params import GuidedDecodingParams
     from vllm.utils import get_open_port
 
+    from vllm import TokensPrompt
+
     if is_vllm_ascend_available():
         from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
 
@@ -102,8 +104,7 @@ class WeightSyncWorkerExtension:
             world_size (`int`):
                 Total number of participating processes in the update group.
             client_device_uuid (`str`):
-                UUID of the device of client main process. Used to assert that devices are different from vllm workers
-                devices.
+                UUID of the device of client main process. Used to assert that devices are different from vllm workers devices.
         """
         if self.pynccl_comm is not None:
             raise RuntimeError("Weight update group already initialized. Call close_communicator first.")
@@ -377,17 +378,6 @@ def chunk_list(lst: list, n: int) -> list[list]:
     return [lst[i * k + min(i, r) : (i + 1) * k + min(i + 1, r)] for i in range(n)]
 
 
-def sanitize_logprob(logprob):
-    import math
-
-    value = logprob.logprob
-    if math.isnan(value):
-        logger.warning(f"Generated NaN logprob, token logprob '{logprob}' will be ignored")
-        return None
-
-    return value
-
-
 def main(script_args: ScriptArguments):
     if not is_fastapi_available():
         raise ImportError(
@@ -466,6 +456,7 @@ def main(script_args: ScriptArguments):
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
+        prompts_ids: Optional[list[list[int]]] = None
         images: Optional[list[str]] = None
         n: int = 1
         repetition_penalty: float = 1.0
@@ -477,11 +468,10 @@ def main(script_args: ScriptArguments):
         guided_decoding_regex: Optional[str] = None
         generation_kwargs: dict = field(default_factory=dict)
 
-    class GenerateResponse(BaseModel):
-        completion_ids: list[list[int]]
-        logprobs: list[list[float]]
+    # class GenerateResponse(BaseModel):
+    #     completion_ids: list[list[int]]
 
-    @app.post("/generate/", response_model=GenerateResponse)
+    @app.post("/generate/") #, response_model=GenerateResponse)
     async def generate(request: GenerateRequest):
         """
         Generates completions for the provided prompts.
@@ -512,8 +502,6 @@ def main(script_args: ScriptArguments):
         Returns:
             `GenerateResponse`:
                 - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
-                - `logprobs` (list of list of `float`): A list of lists of log probabilities for each token in the
-                  generated completions.
 
         Example request:
         ```json
@@ -525,15 +513,28 @@ def main(script_args: ScriptArguments):
         {"completion_ids": [[101, 102, 103], [201, 202, 203]], "logprobs": [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]]}
         ```
         """
-        request.images = request.images or [None] * len(request.prompts)
+        request.images = request.images or [None] * max(len(request.prompts), len(request.prompts_ids if request.prompts_ids is not None else []))
 
-        prompts = []
-        for prompt, image in zip(request.prompts, request.images):
-            row = {"prompt": prompt}
-            if image is not None:
-                row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
-            prompts.append(row)
-
+        # logger.warning('prompts: '+str(request.prompts))
+        # logger.warning('prompt ids: '+str(request.prompts_ids))
+        
+        # print(request.prompts)
+        if request.prompts_ids is None:
+            starting_prompts = request.prompts
+            prompts = []
+            for prompt, image in zip(starting_prompts, request.images):
+                row = {"prompt": prompt}
+                if image is not None:
+                    row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
+                prompts.append(row)
+        else:
+            starting_prompts = request.prompts_ids
+            prompts = []
+            for prompt in starting_prompts:
+                row = TokensPrompt(prompt_token_ids=prompt)
+                prompts.append(row)
+        # logger.warning(str(starting_prompts))
+        
         # Guided decoding, if enabled
         if request.guided_decoding_regex is not None:
             guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
@@ -549,7 +550,8 @@ def main(script_args: ScriptArguments):
             "min_p": request.min_p,
             "max_tokens": request.max_tokens,
             "guided_decoding": guided_decoding,
-            "logprobs": 0,
+            "prompt_logprobs": 20,
+            "logprobs": 20,
         }
         generation_kwargs.update(request.generation_kwargs)
         sampling_params = SamplingParams(**generation_kwargs)
@@ -557,13 +559,20 @@ def main(script_args: ScriptArguments):
         # Evenly distribute prompts across DP ranks
         chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
 
+        logger.warning(str(prompts))
+        
         # Send the prompts to each worker
         for connection, prompts in zip(connections, chunked_prompts):
             # When the number of prompts is less than data_parallel_size, some workers will receive empty prompts.
             # However, vLLM requires that we always send at least one prompt. So we send a placeholder prompt to comply
             # with vLLM's requirement, and we later ignore the result.
+            sampling_params = SamplingParams(**generation_kwargs)
             if not prompts:
-                prompts = ["<placeholder>"]
+                # prompts = ["<placeholder>"]
+                prompts=chunked_prompts[0]
+                sampling_params.n = 1
+                sampling_params.max_tokens = 1
+            logger.warning('conrun: '+str(prompts)+'\n'+str(sampling_params))
             kwargs = {"prompts": prompts, "sampling_params": sampling_params}
             connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
 
@@ -573,15 +582,18 @@ def main(script_args: ScriptArguments):
         # Handle empty prompts (see above)
         all_outputs = [output for output, prompts in zip(all_outputs, chunked_prompts) if prompts]
 
+        
         # Flatten and combine all results
         all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
+        logger.info(str(all_outputs))
+
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         logprobs: list[list[float]] = [
             [sanitize_logprob(next(iter(logprob.values()))) for logprob in output.logprobs]
             for outputs in all_outputs
             for output in outputs.outputs
         ]
-        return {"completion_ids": completion_ids, "logprobs": logprobs}
+        return {"basic": {"completion_ids": completion_ids, "logprobs": logprobs}, "full": all_outputs}
 
     class InitCommunicatorRequest(BaseModel):
         host: str

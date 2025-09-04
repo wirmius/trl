@@ -168,6 +168,7 @@ class VLLMClient:
     def generate(
         self,
         prompts: list[str],
+        prompts_ids: list[list[int]] = None,
         images: Optional[list] = None,
         n: int = 1,
         repetition_penalty: float = 1.0,
@@ -177,7 +178,8 @@ class VLLMClient:
         min_p: float = 0.0,
         max_tokens: int = 16,
         guided_decoding_regex: Optional[str] = None,
-        generation_kwargs: Optional[dict] = None,
+        generation_kwargs: Optional[dict] = None, 
+        return_dict: Optional[bool] = False  
     ) -> list[list[int]]:
         """
         Generates model completions for the provided prompts.
@@ -209,11 +211,8 @@ class VLLMClient:
                 will override them.
 
         Returns:
-            `dict` with keys:
-                - `completion_ids` (`list[list[int]]`):
-                    List of lists of token IDs representing the model-generated completions for each prompt.
-                - `logprobs` (`list[list[float]]`):
-                    List of lists of log probabilities for each generated token.
+            `list[list[int]]`:
+                List of lists of token IDs representing the model-generated completions for each prompt.
         """
         url = f"{self.base_url}/generate/"
 
@@ -230,6 +229,7 @@ class VLLMClient:
             url,
             json={
                 "prompts": prompts,
+                "prompts_ids": prompts_ids,
                 "images": images,
                 "n": n,
                 "repetition_penalty": repetition_penalty,
@@ -243,8 +243,15 @@ class VLLMClient:
             },
         )
         if response.status_code == 200:
-            json_response = response.json()
-            return {"completion_ids": json_response["completion_ids"], "logprobs": json_response["logprobs"]}
+            all_outputs = response.json()
+            # print(all_outputs)
+            if return_dict:
+                return all_outputs['full']
+                # return {"completion_ids": all_outputs["basic"]["completion_ids"], "logprobs": all_outputs["basic"]["logprobs"]}
+            else:
+                return {"completion_ids": all_outputs["basic"]["completion_ids"], "logprobs": all_outputs["basic"]["logprobs"]}
+                # completion_ids = [list(output['token_ids']) for outputs in all_outputs for output in outputs['outputs']]
+                # return completion_ids
         else:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
