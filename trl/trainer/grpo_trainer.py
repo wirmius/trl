@@ -546,7 +546,11 @@ class GRPOTrainer(Trainer):
                 raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
 
             # vLLM specific sampling arguments
-            self.guided_decoding_regex = args.vllm_guided_decoding_regex
+            # initialize guidance for the generation
+            if self.guided_decoding_regex:
+                self.vllm_guided_decoding_kwargs = {"regex": self.guided_decoding_regex}
+            else:
+                self.vllm_guided_decoding_kwargs = None
 
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
 
@@ -1181,7 +1185,7 @@ class GRPOTrainer(Trainer):
                             top_k=-1 if self.top_k is None else self.top_k,
                             min_p=0.0 if self.min_p is None else self.min_p,
                             max_tokens=self.max_completion_length,
-                            guided_decoding_regex=self.guided_decoding_regex,
+                            guided_decoding_kwargs=self.vllm_guided_decoding_kwargs,
                             generation_kwargs=self.args.generation_kwargs,
                         )
                         payload = (output["completion_ids"], output["logprobs"])
@@ -1202,8 +1206,8 @@ class GRPOTrainer(Trainer):
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
-                if self.guided_decoding_regex:
-                    guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
+                if self.vllm_guided_decoding_kwargs:
+                    guided_decoding = GuidedDecodingParams(**self.vllm_guided_decoding_kwargs)  
                 else:
                     guided_decoding = None
 
