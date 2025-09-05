@@ -547,8 +547,8 @@ class GRPOTrainer(Trainer):
 
             # vLLM specific sampling arguments
             # initialize guidance for the generation
-            if self.guided_decoding_regex:
-                self.vllm_guided_decoding_kwargs = {"regex": self.guided_decoding_regex}
+            if self.args.vllm_guided_decoding_regex:
+                self.vllm_guided_decoding_kwargs = {"regex": self.args.vllm_guided_decoding_regex}
             else:
                 self.vllm_guided_decoding_kwargs = None
 
