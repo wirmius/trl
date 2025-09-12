@@ -246,7 +246,7 @@ class VLLMClient:
             all_outputs = response.json()
             # print(all_outputs)
             if return_dict:
-                return all_outputs['full']
+                return {**all_outputs['basic'], **all_outputs['extra']}
                 # return {"completion_ids": all_outputs["basic"]["completion_ids"], "logprobs": all_outputs["basic"]["logprobs"]}
             else:
                 return {"completion_ids": all_outputs["basic"]["completion_ids"], "logprobs": all_outputs["basic"]["logprobs"]}

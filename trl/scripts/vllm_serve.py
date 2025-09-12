@@ -23,9 +23,18 @@ from io import BytesIO
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
+
+import multiprocessing
+import concurrent.futures
+
+from functools import partial
+
 from typing import Optional
 
+import time
+
 import torch
+import numpy as np
 from transformers import is_vision_available
 
 from trl import TrlParser
@@ -333,6 +342,7 @@ def llm_worker(
         worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
         trust_remote_code=script_args.trust_remote_code,
         model_impl=script_args.vllm_model_impl,
+        guided_decoding_backend="guidance"
     )
 
     # Send ready signal to parent process
@@ -408,6 +418,10 @@ def main(script_args: ScriptArguments):
     if not is_vllm_available():
         raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
 
+    ## create a proces pool executor in order to use it for all sorts of small processing
+    # assert multiprocessing.get_start_method()=='spawn', f"Start method must be spawn ! {multiprocessing.get_start_method()}"
+    executor_pool = concurrent.futures.ProcessPoolExecutor(max_workers=32, mp_context=multiprocessing.get_context('spawn'))
+
     # Spawn dp workers, and setup pipes for communication
     master_port = get_open_port()
     connections = []
@@ -430,6 +444,9 @@ def main(script_args: ScriptArguments):
                     ready_connections.add(connection)
 
         yield
+
+        # kill the process pool 
+        executor_pool.shutdown(wait=True)
 
         # Wait for processes to terminate
         for process in processes:
@@ -524,6 +541,8 @@ def main(script_args: ScriptArguments):
         {"completion_ids": [[101, 102, 103], [201, 202, 203]], "logprobs": [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]]}
         ```
         """
+        start_time = time.time()
+        logger.warning(f"Starting a request, wallclock: {start_time:.3f}")
         request.images = request.images or [None] * max(len(request.prompts), len(request.prompts_ids if request.prompts_ids is not None else []))
 
         # logger.warning('prompts: '+str(request.prompts))
@@ -549,6 +568,7 @@ def main(script_args: ScriptArguments):
         # Guided decoding, if enabled
         if request.guided_decoding_kwargs is not None:
             guided_decoding = GuidedDecodingParams(**request.guided_decoding_kwargs)
+            logger.warning(str(request.guided_decoding_kwargs))
         else:
             guided_decoding = None
 
@@ -561,8 +581,9 @@ def main(script_args: ScriptArguments):
             "min_p": request.min_p,
             "max_tokens": request.max_tokens,
             "guided_decoding": guided_decoding,
-            "prompt_logprobs": 20,
-            "logprobs": 1,
+            # "prompt_logprobs": 20,
+            "logprobs": 0,
+            # **generation_kwargs,
         }
         generation_kwargs.update(request.generation_kwargs)
         sampling_params = SamplingParams(**generation_kwargs)
@@ -570,7 +591,10 @@ def main(script_args: ScriptArguments):
         # Evenly distribute prompts across DP ranks
         chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
 
-        logger.warning(str(prompts))
+        prep_time = time.time()
+        logger.warning(f"Preparation done, wallclock: {prep_time:.3f}; delta: {prep_time-start_time:.3f}")
+
+        # logger.warning(str(prompts))
         
         # Send the prompts to each worker
         for connection, prompts in zip(connections, chunked_prompts):
@@ -583,20 +607,22 @@ def main(script_args: ScriptArguments):
                 prompts=chunked_prompts[0]
                 sampling_params.n = 1
                 sampling_params.max_tokens = 1
-            logger.warning('conrun: '+str(prompts)+'\n'+str(sampling_params))
+            # logger.warning('conrun: '+str(prompts)+'\n'+str(sampling_params))
             kwargs = {"prompts": prompts, "sampling_params": sampling_params}
             connection.send({"type": "call", "method": "generate", "kwargs": kwargs})
 
         # Receive results
         all_outputs = [connection.recv() for connection in connections]
 
+        recved_output_time = time.time()
+        logger.warning(f"Output received from workers, wallclock: {recved_output_time:.3f}; delta: {recved_output_time-prep_time:.3f}")
+
         # Handle empty prompts (see above)
         all_outputs = [output for output, prompts in zip(all_outputs, chunked_prompts) if prompts]
 
-        
         # Flatten and combine all results
         all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
-        logger.info(str(all_outputs))
+        # logger.info(str(all_outputs))
 
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         logprobs: list[list[float]] = [
@@ -604,7 +630,30 @@ def main(script_args: ScriptArguments):
             for outputs in all_outputs
             for output in outputs.outputs
         ]
-        return {"basic": {"completion_ids": completion_ids, "logprobs": logprobs}, "full": all_outputs}
+
+        extra_stuff = {}
+
+        all_cached_tokens_hist = [outputs.num_cached_tokens for outputs in all_outputs]
+        logger.warning(f"Average cache hit : {all_cached_tokens_hist} tokens / per request")
+
+        # process prompt logprobs if necessary
+        if 'prompt_logprobs' in generation_kwargs:
+            max_logprobs_count = generation_kwargs['prompt_logprobs']
+            # all_prompt_logprobs = [outputs.prompt_logprobs for outputs in all_outputs]
+            prompt_log_probs_lists = executor_pool.map(partial(vllm_extract_prompt_logits, max_logprobs=21), all_outputs, chunksize=len(all_outputs)//31)
+            # repeat if request.n > 1
+            if request.n > 1:
+                prompt_log_probs_lists = [y for x in prompt_log_probs_lists for y in (x,)*request.n]
+            extra_stuff['prompt_logprobs'] = prompt_log_probs_lists
+
+        extra_stuff['prompt_token_ids'] = [outputs.prompt_token_ids for outputs in all_outputs]
+        if request.n > 1:
+            extra_stuff['prompt_token_ids'] = [y for x in extra_stuff['prompt_token_ids'] for y in (x,)*request.n]
+
+        send_stuff_back_time = time.time()
+        logger.warning(f"Sending stuff back, wallclock: {send_stuff_back_time:.3f}; delta: {send_stuff_back_time-recved_output_time:.3f}")
+        
+        return {"basic": {"completion_ids": completion_ids, "logprobs": logprobs}, "extra": extra_stuff}
 
     class InitCommunicatorRequest(BaseModel):
         host: str
@@ -699,6 +748,32 @@ def make_parser(subparsers: argparse._SubParsersAction = None):
     else:
         parser = TrlParser(ScriptArguments)
     return parser
+
+
+def vllm_extract_prompt_logits(ro, max_logprobs=21): #: RequestOutput):
+    # prompt_logprobs are [{id: Logprob(), ...}, ...]
+    # this extracts them as ~2 arrays
+    # first position, usually, has a None instead of a dict, skip it!
+    lps = ro.prompt_logprobs
+
+    retlist_logprobs = []
+    retlist_ids = []
+    
+    for position, subdict in enumerate(lps):
+        if subdict is None:
+            # only first token is allowed to be NA
+            assert position==0
+            continue
+        lp_accum = []
+        id_accum = []
+        for idx, lp in subdict.items():
+            lp_accum.append(lp.logprob)
+            id_accum.append(idx)
+        lp_accum += [90000,]*(max_logprobs-len(lp_accum))
+        id_accum += [-1,]*(max_logprobs-len(id_accum))
+        retlist_logprobs.append(lp_accum)
+        retlist_ids.append(id_accum)
+    return retlist_ids, retlist_logprobs
 
 
 if __name__ == "__main__":

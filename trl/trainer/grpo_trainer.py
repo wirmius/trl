@@ -539,6 +539,7 @@ class GRPOTrainer(Trainer):
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
+                    guided_decoding_backend="guidance"
                 )
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=1)
