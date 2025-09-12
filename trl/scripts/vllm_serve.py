@@ -640,7 +640,7 @@ def main(script_args: ScriptArguments):
         if 'prompt_logprobs' in generation_kwargs:
             max_logprobs_count = generation_kwargs['prompt_logprobs']
             # all_prompt_logprobs = [outputs.prompt_logprobs for outputs in all_outputs]
-            prompt_log_probs_lists = executor_pool.map(partial(vllm_extract_prompt_logits, max_logprobs=21), all_outputs, chunksize=len(all_outputs)//31)
+            prompt_log_probs_lists = executor_pool.map(partial(vllm_extract_prompt_logits, max_logprobs=21), all_outputs, chunksize=1+(len(all_outputs)//31))
             # repeat if request.n > 1
             if request.n > 1:
                 prompt_log_probs_lists = [y for x in prompt_log_probs_lists for y in (x,)*request.n]
