@@ -21,7 +21,7 @@ from collections import defaultdict, deque
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Type
 
 import datasets
 import torch
@@ -217,7 +217,15 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        vllm_base_class: Optional[Type] = None,
+        vllmclient_base_class: Optional[Type] = None,
     ):
+        # SET THE BASE CLASSES TO DEFAULE
+        if vllm_base_class is None and is_vllm_available():
+            vllm_base_class = LLM
+        if vllmclient_base_class is None and is_vllm_available():
+            vllm_base_class = VLLMClient
+        
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -491,7 +499,7 @@ class GRPOTrainer(Trainer):
                         base_url = args.vllm_server_base_url
                     else:
                         base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
-                    self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
+                    self.vllm_client = vllmclient_base_class(base_url=base_url, connection_timeout=args.vllm_server_timeout)
                     self.vllm_client.init_communicator(device=torch.cuda.current_device())
 
             elif self.vllm_mode == "colocate":
@@ -524,7 +532,7 @@ class GRPOTrainer(Trainer):
                     max_model_len = self.max_prompt_length + self.max_completion_length
                 else:
                     max_model_len = None
-                self.llm = LLM(
+                self.llm = vllm_base_class(
                     model=model.name_or_path,
                     tensor_parallel_size=args.vllm_tensor_parallel_size,
                     gpu_memory_utilization=self.vllm_gpu_memory_utilization,
@@ -539,8 +547,9 @@ class GRPOTrainer(Trainer):
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
                     enable_sleep_mode=self.args.vllm_enable_sleep_mode,
-                    guided_decoding_backend="guidance"
+                    guided_decoding_backend="guidance",
                 )
+                
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=1)
             else:
