@@ -224,7 +224,7 @@ class GRPOTrainer(Trainer):
         if vllm_base_class is None and is_vllm_available():
             vllm_base_class = LLM
         if vllmclient_base_class is None and is_vllm_available():
-            vllm_base_class = VLLMClient
+            vllmclient_base_class = VLLMClient
         
         # Args
         if args is None:
