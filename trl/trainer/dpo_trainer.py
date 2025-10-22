@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import inspect
-import os
 import random
 import textwrap
+import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -32,15 +32,13 @@ from datasets import Dataset, IterableDataset
 from torch import autocast
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
+    AutoProcessor,
     BaseImageProcessor,
     DataCollator,
     FeatureExtractionMixin,
     PreTrainedModel,
     PreTrainedTokenizerBase,
     ProcessorMixin,
-    Trainer,
 )
 from transformers.data.data_collator import DataCollatorMixin
 from transformers.integrations import (
@@ -48,7 +46,7 @@ from transformers.integrations import (
     is_mlflow_available,
     is_wandb_available,
 )
-from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
+from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_liger_kernel_available, is_peft_available
@@ -56,17 +54,17 @@ from transformers.utils import is_liger_kernel_available, is_peft_available
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..models import create_reference_model, prepare_deepspeed
 from ..models.utils import prepare_fsdp
+from .base_trainer import BaseTrainer
 from .callbacks import SyncRefModelCallback
 from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
 from .utils import (
     RunningMoments,
     cap_exp,
+    create_model_from_path,
     disable_dropout_in_model,
     empty_cache,
     flush_left,
     flush_right,
-    generate_model_card,
-    get_comet_experiment_url,
     log_table_to_comet_experiment,
     pad,
     pad_to_length,
@@ -179,11 +177,14 @@ class DataCollatorForPreference(DataCollatorMixin):
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
+        if "token_type_ids" in examples[0]:
+            token_type_ids = [torch.tensor(example["token_type_ids"]) for example in examples]
+            output["token_type_ids"] = pad(token_type_ids, padding_value=0, padding_side="left")
 
         return output
 
 
-class DPOTrainer(Trainer):
+class DPOTrainer(BaseTrainer):
     """
     Trainer for Direct Preference Optimization (DPO) method.
 
@@ -199,13 +200,13 @@ class DPOTrainer(Trainer):
               using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keyword arguments in
               `args.model_init_kwargs`.
             - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
-        ref_model (`PreTrainedModelWrapper`):
+        ref_model ([`PreTrainedModelWrapper`]):
             Hugging Face transformer model with a casual language modelling head. Used for implicit reward computation
             and loss. If no reference model is provided, the trainer will create a reference model with the same
             architecture as the model to be optimized.
-        args ([`DPOConfig`], *optional*, defaults to `None`):
+        args ([`DPOConfig`], *optional*):
             Configuration for this trainer. If `None`, a default configuration is used.
-        data_collator (`DataCollator`, *optional*):
+        data_collator ([`~transformers.DataCollator`], *optional*):
             Function to use to form a batch from a list of elements of the processed `train_dataset` or `eval_dataset`.
             Will default to [`DataCollatorForPreference`].
         train_dataset ([`~datasets.Dataset`] or [`~datasets.IterableDataset`]):
@@ -215,10 +216,9 @@ class DPOTrainer(Trainer):
             - [Standard](dataset_formats#standard): Each sample contains plain text.
             - [Conversational](dataset_formats#conversational): Each sample contains structured messages (e.g., role
               and content).
-        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset,
-        IterableDataset]]`):
+        eval_dataset ([`~datasets.Dataset`], [`~datasets.IterableDataset`] or `dict[str, Union[Dataset, IterableDataset]]`):
             Dataset to use for evaluation. It must meet the same requirements as `train_dataset`.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*, defaults to `None`):
+        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`], *optional*):
             Processing class used to process the data. If `None`, the processing class is loaded from the model's name
             with [`~transformers.AutoTokenizer.from_pretrained`].
         compute_metrics (`Callable[[EvalPrediction], dict]`, *optional*):
@@ -227,32 +227,44 @@ class DPOTrainer(Trainer):
             `True`, your compute_metrics function must take a boolean `compute_result` argument. This will be triggered
             after the last eval batch to signal that the function needs to calculate and return the global summary
             statistics rather than accumulating the batch-level statistics.
-        callbacks (list of [`~transformers.TrainerCallback`], *optional*, defaults to `None`):
+        callbacks (list of [`~transformers.TrainerCallback`], *optional*):
             List of callbacks to customize the training loop. Will add those to the list of default callbacks detailed
             in [here](https://huggingface.co/docs/transformers/main_classes/callback).
 
             If you want to remove one of the default callbacks used, use the [`~transformers.Trainer.remove_callback`]
             method.
-        optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`, *optional*, defaults to `(None,
-        None)`):
+        optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`, *optional*, defaults to `(None, None)`):
             A tuple containing the optimizer and the scheduler to use. Will default to an instance of [`AdamW`] on your
             model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
-        optimizer_cls_and_kwargs (`Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]`, *optional*, defaults to
-        `None`):
+        optimizer_cls_and_kwargs (`Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]`, *optional*):
             A tuple containing the optimizer class and keyword arguments to use. Overrides `optim` and `optim_args` in
             `args`. Incompatible with the `optimizers` argument.
-        preprocess_logits_for_metrics (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`, *optional*, defaults to
-        `None`):
+        preprocess_logits_for_metrics (`Callable[[torch.Tensor, torch.Tensor], torch.Tensor]`, *optional*):
             A function that preprocess the logits right before caching them at each evaluation step. Must take two
             tensors, the logits and the labels, and return the logits once processed as desired. The modifications made
             by this function will be reflected in the predictions received by `compute_metrics`.
 
             Note that the labels (second parameter) will be `None` if the dataset does not have them.
-        peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
+        peft_config ([`~peft.PeftConfig`], *optional*):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
     """
 
     _tag_names = ["trl", "dpo"]
+    _name = "DPO"
+    _paper = {
+        "title": "Direct Preference Optimization: Your Language Model is Secretly a Reward Model",
+        "id": "2305.18290",
+        # docstyle-ignore
+        "citation": textwrap.dedent("""\
+            @inproceedings{rafailov2023direct,
+                title        = {{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}},
+                author       = {Rafael Rafailov and Archit Sharma and Eric Mitchell and Christopher D. Manning and Stefano Ermon and Chelsea Finn},
+                year         = 2023,
+                booktitle    = {Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023},
+                url          = {http://papers.nips.cc/paper_files/paper/2023/hash/a85b405ed65c6477a4fe8302b5e06ce7-Abstract-Conference.html},
+                editor       = {Alice Oh and Tristan Naumann and Amir Globerson and Kate Saenko and Moritz Hardt and Sergey Levine},
+            }"""),
+    }
 
     def __init__(
         self,
@@ -273,52 +285,66 @@ class DPOTrainer(Trainer):
         peft_config: Optional["PeftConfig"] = None,
     ):
         # Args
-        model_id = model if isinstance(model, str) else model.config._name_or_path
         if args is None:
-            model_name = model_id.split("/")[-1]
+            model_name = model if isinstance(model, str) else model.config._name_or_path
+            model_name = model_name.split("/")[-1]
             args = DPOConfig(f"{model_name}-DPO")
 
-        # Handle the tokenizer
-        if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model_id)
-
-        if args.padding_value is not None:
-            self.padding_value = args.padding_value
+        # Model and reference model
+        if isinstance(model, str):
+            model = create_model_from_path(model, **args.model_init_kwargs or {})
         else:
-            if hasattr(processing_class, "pad_token_id") and processing_class.pad_token_id is not None:
-                self.padding_value = processing_class.pad_token_id
-            elif hasattr(processing_class, "tokenizer") and processing_class.tokenizer.pad_token_id is not None:
-                self.padding_value = processing_class.tokenizer.pad_token_id
-            else:
-                raise ValueError(
-                    "`padding_value` is not specified in `DPOConfig`, and `pad_token_id` is missing in the "
-                    "`processing_class`. Please either set the `padding_value` argument in `DPOConfig`, or set "
-                    "`tokenizer.pad_token` (e.g., `tokenizer.pad_token = tokenizer.eos_token`) before instantiating "
-                    "the trainer."
+            if args.model_init_kwargs is not None:
+                logger.warning(
+                    "You passed `model_init_kwargs` to the `DPOConfig`, but your model is already instantiated. "
+                    "The `model_init_kwargs` will be ignored."
                 )
-
-        # Model
-        if not isinstance(model, str) and ref_model is model:
+        model_id = model.config._name_or_path
+        if isinstance(ref_model, str):
+            ref_model = create_model_from_path(ref_model, **args.ref_model_init_kwargs or {})
+        else:
+            if args.ref_model_init_kwargs is not None:
+                logger.warning(
+                    "You passed `ref_model_init_kwargs` to the `DPOConfig`, but your model is already instantiated. "
+                    "The `ref_model_init_kwargs` will be ignored."
+                )
+        if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
-                "same as `model`, you must mass a copy of it, or `None` if you use peft."
+                "same as `model`, you can simply omit the `ref_model` argument and it will be created for you."
             )
 
-        if args.model_init_kwargs is not None and not isinstance(model, str):
-            logger.warning(
-                "You passed model_init_kwargs to the `DPOConfig`, but your model is already instantiated. "
-                "The `model_init_kwargs` will be ignored."
-            )
-        if isinstance(model, str):
-            model = self._create_model_from_path(model, args)
+        # Processing class
+        if processing_class is None:
+            processing_class = AutoProcessor.from_pretrained(model_id)
 
-        if args.ref_model_init_kwargs is not None and not isinstance(ref_model, str):
-            logger.warning(
-                "You passed ref_model_init_kwargs to the `DPOConfig`, but your ref_model is already instantiated. "
-                "The `ref_model_init_kwargs` will be ignored."
+        # Handle pad token for processors or tokenizers
+        if isinstance(processing_class, ProcessorMixin):
+            tokenizer = processing_class.tokenizer
+            self._is_vlm = True
+        elif isinstance(processing_class, PreTrainedTokenizerBase):
+            tokenizer = processing_class
+            self._is_vlm = False
+        else:
+            raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
+
+        # Get the pad token: if not provided, use the one from the processing class or the eos token
+        # if the processing class does not have a pad token.
+        if args.padding_value is not None:  # deprecated, will be removed in 0.26.0.
+            warnings.warn(
+                "The `padding_value` argument is deprecated and will be removed in version 0.26.0. Please use "
+                "`pad_token` (str) instead."
             )
-        if isinstance(ref_model, str):
-            ref_model = self._create_model_from_path(ref_model, args, is_ref=True)
+            self.pad_token_id = args.padding_value
+        else:
+            pad_token = args.pad_token or tokenizer.pad_token or tokenizer.eos_token
+            self.pad_token_id = tokenizer.convert_tokens_to_ids(pad_token)
+            if self.pad_token_id is None:
+                raise ValueError(
+                    f"The specified `pad_token` ('{pad_token}') is not found in the vocabulary of the given "
+                    f"`processing_class` ({processing_class.__class__.__name__}). Ensure that the `pad_token` exists "
+                    "in the vocabulary before using it as a padding token."
+                )
 
         # PEFT configuration and model wrapping
         model = self._prepare_peft_model(model, ref_model, peft_config, args)
@@ -330,7 +356,7 @@ class DPOTrainer(Trainer):
             )
 
         self.is_encoder_decoder = model.config.is_encoder_decoder
-        self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
+        self.is_vision_model = model.config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.keys()
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
@@ -380,7 +406,7 @@ class DPOTrainer(Trainer):
 
         # Data collator
         if data_collator is None:
-            data_collator = DataCollatorForPreference(pad_token_id=self.padding_value)
+            data_collator = DataCollatorForPreference(pad_token_id=self.pad_token_id)
 
         self.generate_during_eval = args.generate_during_eval
         self.label_pad_token_id = args.label_pad_token_id
@@ -520,29 +546,21 @@ class DPOTrainer(Trainer):
         if "bco_pair" in self.loss_type:
             self.running = RunningMoments(self.accelerator)
 
-    def _create_model_from_path(self, model_path: str, args: DPOConfig, is_ref: bool = False) -> PreTrainedModel:
-        """Creates a model from a path or model identifier."""
-        if not is_ref:
-            model_init_kwargs = args.model_init_kwargs or {}
-        else:
-            model_init_kwargs = args.ref_model_init_kwargs or {}
+    @property
+    def padding_value(self):
+        warnings.warn(
+            "The `padding_value` property is deprecated and will be removed in version 0.26.0. Please use "
+            "`pad_token_id` instead.",
+        )
+        return self.pad_token_id
 
-        # Handle torch dtype
-        dtype = model_init_kwargs.get("dtype")
-        if isinstance(dtype, torch.dtype) or dtype == "auto" or dtype is None:
-            pass  # dtype is already a torch.dtype or "auto" or None
-        elif isinstance(dtype, str):  # it's a str, but not "auto"
-            dtype = getattr(torch, dtype)
-            model_init_kwargs["dtype"] = dtype
-        else:
-            raise ValueError(
-                "Invalid `dtype` passed to `DPOConfig`. Expected either 'auto' or a string representing "
-                f"a `torch.dtype` (e.g., 'float32'), but got {dtype}."
-            )
-
-        # Create model
-        model = AutoModelForCausalLM.from_pretrained(model_path, **model_init_kwargs)
-        return model
+    @padding_value.setter
+    def padding_value(self, value):
+        warnings.warn(
+            "The `padding_value` property is deprecated and will be removed in version 0.26.0. Please use "
+            "`pad_token_id` instead.",
+        )
+        self.pad_token_id = value
 
     def _prepare_peft_model(
         self, model: PreTrainedModel, ref_model: PreTrainedModel, peft_config: Any, args: DPOConfig
@@ -674,7 +692,7 @@ class DPOTrainer(Trainer):
         Args:
             features (`dict[str, str]`):
                 Row of the dataset, should contain the keys `"prompt"`, `"chosen"`, and `"rejected"`.
-            processing_class (`PreTrainedTokenizerBase`):
+            processing_class ([`~transformers.PreTrainedTokenizerBase`]):
                 Processing class used to process the data.
             max_prompt_length (`int` or `None`):
                 Maximum length of the prompt sequence. If `None`, the prompt sequence is not truncated.
@@ -775,6 +793,8 @@ class DPOTrainer(Trainer):
             output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
         if "image_sizes" in processed_features:
             output["image_sizes"] = processed_features["image_sizes"][0]
+        if "token_type_ids" in processed_features:
+            output["token_type_ids"] = processed_features["token_type_ids"][0]
 
         return output
 
@@ -789,6 +809,7 @@ class DPOTrainer(Trainer):
                 "chosen_input_ids",
                 "rejected_input_ids",
                 "image_sizes",
+                "token_type_ids",
                 "ref_chosen_logps",
                 "ref_rejected_logps",
             ]
@@ -976,6 +997,8 @@ class DPOTrainer(Trainer):
             )
         if "image_sizes" in batch:
             output["image_sizes"] = torch.cat([batch["image_sizes"], batch["image_sizes"]], dim=0)
+        if "token_type_ids" in batch:
+            output["token_type_ids"] = torch.cat((batch["token_type_ids"], batch["token_type_ids"]))
 
         # Concatenate the chosen and rejected completions
         max_completion_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
@@ -1015,6 +1038,29 @@ class DPOTrainer(Trainer):
                 Log probabilities of the reference model for the chosen responses. Shape: `(batch_size,)`.
             ref_rejected_logps (`torch.FloatTensor`):
                 Log probabilities of the reference model for the rejected responses. Shape: `(batch_size,)`.
+            loss_type (`str`, defaults to `"sigmoid"`):
+                The type of loss to compute. One of:
+                - `"sigmoid"`: Sigmoid loss from the original [DPO](https://huggingface.co/papers/2305.18290) paper.
+                - `"hinge"`: Hinge loss on the normalized likelihood from the
+                  [SLiC](https://huggingface.co/papers/2305.10425) paper.
+                - `"ipo"`: IPO loss from the [IPO](https://huggingface.co/papers/2310.12036) paper.
+                - `"exo_pair"`: Pairwise EXO loss from the [EXO](https://huggingface.co/papers/2402.00856) paper.
+                - `"nca_pair"`: Pairwise NCA loss from the [NCA](https://huggingface.co/papers/2402.05369) paper.
+                - `"robust"`: Unbiased estimate of the DPO loss that is robust to preference noise from the [Robust
+                  DPO](https://huggingface.co/papers/2403.00409) paper.
+                - `"bco_pair"`: Pairwise BCO loss from the [BCO](https://huggingface.co/papers/2404.04656) paper.
+                - `"sppo_hard"`: SPPO loss with hard label from the [SPPO](https://huggingface.co/papers/2405.00675)
+                  paper.
+                - `"aot"`: AOT loss for paired datasets from the [AOT](https://huggingface.co/papers/2406.05882) paper.
+                - `"aot_pair"`: AOT loss for unpaired datasets from the [AOT](https://huggingface.co/papers/2406.05882)
+                  paper.
+                - `"discopop"`: DiscoPOP (a.k.a Log-Ratio Modulated Loss, LRML) loss from the
+                  [DiscoPOP](https://huggingface.co/papers/2406.08414) paper.
+                - `"apo_zero"`: APO-zero loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
+                - `"apo_down"`: APO-down loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
+                - `"sft"`: Negative log-likelihood loss (standard supervised fine-tuning loss).
+            model_output (`dict[str, torch.FloatTensor]`, *optional*):
+                The output of the model's forward pass. This is used to compute auxiliary losses if enabled.
 
         Returns:
             A tuple of three tensors: `(losses, chosen_rewards, rejected_rewards)`. The losses tensor contains the DPO
@@ -1027,7 +1073,7 @@ class DPOTrainer(Trainer):
         chosen_logratios = chosen_logps.to(device) - (not self.reference_free) * ref_chosen_logps.to(device)
         rejected_logratios = rejected_logps.to(device) - (not self.reference_free) * ref_rejected_logps.to(device)
 
-        if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
+        if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE:
             # The alpha-divergence formula: (1 - u^-alpha) / alpha
             # The divergence difference between the chosen and rejected sample is:
             #     (1 - u[w]^-alpha) / alpha - (1 - u[l]^-alpha) / alpha
@@ -1049,7 +1095,7 @@ class DPOTrainer(Trainer):
             ref_logratios = ref_logratios.to(self.accelerator.device)
             logits = logratios - ref_logratios
 
-            if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE.value:
+            if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE:
                 # The js-divergence formula: log(2 * u / (1 + u))
                 # The divergence difference between the chosen and rejected sample is:
                 #     log(2 * u[w] / (1 + u[w])) - log(2 * u[l] / (1 + u[l]))
@@ -1198,7 +1244,7 @@ class DPOTrainer(Trainer):
         self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]
     ) -> dict[str, torch.Tensor]:
         unwrapped_model = self.accelerator.unwrap_model(model)
-        concatenated_batch = self.concatenated_inputs(batch, padding_value=self.padding_value)
+        concatenated_batch = self.concatenated_inputs(batch, padding_value=self.pad_token_id)
 
         model_kwargs = {}
         if self.aux_loss_enabled:
@@ -1445,7 +1491,7 @@ class DPOTrainer(Trainer):
         """
         num_examples = batch["prompt_input_ids"].shape[0]
 
-        concatenated_batch = self.concatenated_inputs(batch, padding_value=self.padding_value)
+        concatenated_batch = self.concatenated_inputs(batch, padding_value=self.pad_token_id)
 
         model_kwargs = {"use_cache": False}
         if self.aux_loss_enabled:
@@ -1478,6 +1524,9 @@ class DPOTrainer(Trainer):
             # Concatenate the prompt and completion inputs
             input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
             attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
+            if "token_type_ids" in concatenated_batch:
+                prompt_token_type_ids = concatenated_batch["token_type_ids"]
+                token_type_ids = pad_to_length(prompt_token_type_ids, input_ids.shape[1], 0)
             # Mask the prompt but not the completion for the loss
             loss_mask = torch.cat(
                 (torch.zeros_like(prompt_attention_mask), completion_attention_mask),
@@ -1490,7 +1539,12 @@ class DPOTrainer(Trainer):
                     # Flush left to reduce the memory usage
                     # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
                     #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
-                    attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
+                    if "token_type_ids" in concatenated_batch:
+                        attention_mask, input_ids, loss_mask, token_type_ids = flush_left(
+                            attention_mask, input_ids, loss_mask, token_type_ids
+                        )
+                    else:
+                        attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
                     attention_mask = attention_mask[:, : self.max_length]
                     input_ids = input_ids[:, : self.max_length]
                     loss_mask = loss_mask[:, : self.max_length]
@@ -1498,11 +1552,22 @@ class DPOTrainer(Trainer):
                     # Flush right before truncating left, then flush left
                     # [[0, 0, x, x, x, x],  ->  [[0, 0, x, x],
                     #  [0, x, x, x, 0, 0]]       [0, x, x, x]]
-                    attention_mask, input_ids, loss_mask = flush_right(attention_mask, input_ids, loss_mask)
+                    if "token_type_ids" in concatenated_batch:
+                        attention_mask, input_ids, loss_mask, token_type_ids = flush_left(
+                            attention_mask, input_ids, loss_mask, token_type_ids
+                        )
+                        token_type_ids = token_type_ids[:, -self.max_length :]
+                    else:
+                        attention_mask, input_ids, loss_mask = flush_right(attention_mask, input_ids, loss_mask)
                     input_ids = input_ids[:, -self.max_length :]
                     attention_mask = attention_mask[:, -self.max_length :]
                     loss_mask = loss_mask[:, -self.max_length :]
-                    attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
+                    if "token_type_ids" in concatenated_batch:
+                        attention_mask, input_ids, loss_mask, token_type_ids = flush_left(
+                            attention_mask, input_ids, loss_mask, token_type_ids
+                        )
+                    else:
+                        attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
                 else:
                     raise ValueError(
                         f"Unknown truncation mode: '{self.truncation_mode}'. Should be one of ['keep_end', "
@@ -1512,7 +1577,15 @@ class DPOTrainer(Trainer):
                 # Flush left to reduce the memory usage
                 # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
                 #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
-                attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
+                if "token_type_ids" in concatenated_batch:
+                    attention_mask, input_ids, loss_mask, token_type_ids = flush_left(
+                        attention_mask, input_ids, loss_mask, token_type_ids
+                    )
+                else:
+                    attention_mask, input_ids, loss_mask = flush_left(attention_mask, input_ids, loss_mask)
+
+            if "token_type_ids" in concatenated_batch:
+                model_kwargs["token_type_ids"] = token_type_ids
 
             if self.use_logits_to_keep:
                 # Compute logits_to_keep based on loss_mask pattern:
@@ -1773,7 +1846,7 @@ class DPOTrainer(Trainer):
                 attention_mask=batch["prompt_attention_mask"],
                 max_length=self.max_length,
                 do_sample=True,
-                pad_token_id=self.padding_value,
+                pad_token_id=self.pad_token_id,
             )
 
             # if ref_output in batch use that otherwise use the reference model
@@ -1787,7 +1860,7 @@ class DPOTrainer(Trainer):
                             attention_mask=batch["prompt_attention_mask"],
                             max_length=self.max_length,
                             do_sample=True,
-                            pad_token_id=self.padding_value,
+                            pad_token_id=self.pad_token_id,
                         )
                 else:
                     ref_output = self.ref_model.generate(
@@ -1795,13 +1868,13 @@ class DPOTrainer(Trainer):
                         attention_mask=batch["prompt_attention_mask"],
                         max_length=self.max_length,
                         do_sample=True,
-                        pad_token_id=self.padding_value,
+                        pad_token_id=self.pad_token_id,
                     )
 
-        policy_output = pad_to_length(policy_output, self.max_length, self.padding_value)
+        policy_output = pad_to_length(policy_output, self.max_length, self.pad_token_id)
         policy_output_decoded = self.processing_class.batch_decode(policy_output, skip_special_tokens=True)
 
-        ref_output = pad_to_length(ref_output, self.max_length, self.padding_value)
+        ref_output = pad_to_length(ref_output, self.max_length, self.pad_token_id)
         ref_output_decoded = self.processing_class.batch_decode(ref_output, skip_special_tokens=True)
 
         return policy_output_decoded, ref_output_decoded
@@ -1910,7 +1983,7 @@ class DPOTrainer(Trainer):
         Args:
             logs (`dict[str, float]`):
                 The values to log.
-            start_time (`float` or `None`, *optional*, defaults to `None`):
+            start_time (`float`, *optional*):
                 Start time of the training.
         """
         # logs either has 'loss' or 'eval_loss'
@@ -1929,73 +2002,3 @@ class DPOTrainer(Trainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
         super()._save_checkpoint(model, trial)
-
-    def create_model_card(
-        self,
-        model_name: Optional[str] = None,
-        dataset_name: Optional[str] = None,
-        tags: Union[str, list[str], None] = None,
-    ):
-        """
-        Creates a draft of a model card using the information available to the `Trainer`.
-
-        Args:
-            model_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the model.
-            dataset_name (`str` or `None`, *optional*, defaults to `None`):
-                Name of the dataset used for training.
-            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
-                Tags to be associated with the model card.
-        """
-        if not self.is_world_process_zero():
-            return
-
-        if hasattr(self.model.config, "_name_or_path") and not os.path.isdir(self.model.config._name_or_path):
-            base_model = self.model.config._name_or_path
-        else:
-            base_model = None
-
-        # normalize `tags` to a mutable set
-        if tags is None:
-            tags = set()
-        elif isinstance(tags, str):
-            tags = {tags}
-        else:
-            tags = set(tags)
-
-        if hasattr(self.model.config, "unsloth_version"):
-            tags.add("unsloth")
-
-        if "JOB_ID" in os.environ:
-            tags.add("hf_jobs")
-
-        tags.update(self._tag_names)
-
-        # docstyle-ignore
-        citation = textwrap.dedent(
-            """\
-            @inproceedings{rafailov2023direct,
-                title        = {{Direct Preference Optimization: Your Language Model is Secretly a Reward Model}},
-                author       = {Rafael Rafailov and Archit Sharma and Eric Mitchell and Christopher D. Manning and Stefano Ermon and Chelsea Finn},
-                year         = 2023,
-                booktitle    = {Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023},
-                url          = {http://papers.nips.cc/paper_files/paper/2023/hash/a85b405ed65c6477a4fe8302b5e06ce7-Abstract-Conference.html},
-                editor       = {Alice Oh and Tristan Naumann and Amir Globerson and Kate Saenko and Moritz Hardt and Sergey Levine},
-            }"""
-        )
-
-        model_card = generate_model_card(
-            base_model=base_model,
-            model_name=model_name,
-            hub_model_id=self.hub_model_id,
-            dataset_name=dataset_name,
-            tags=tags,
-            wandb_url=wandb.run.url if is_wandb_available() and wandb.run is not None else None,
-            comet_url=get_comet_experiment_url(),
-            trainer_name="DPO",
-            trainer_citation=citation,
-            paper_title="Direct Preference Optimization: Your Language Model is Secretly a Reward Model",
-            paper_id="2305.18290",
-        )
-
-        model_card.save(os.path.join(self.args.output_dir, "README.md"))

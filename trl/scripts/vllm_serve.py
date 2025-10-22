@@ -34,8 +34,9 @@ from typing import Optional
 import time
 
 import torch
+import torch.distributed.distributed_c10d as c10d
 import numpy as np
-from transformers import is_vision_available
+from transformers import is_torch_xpu_available, is_vision_available
 
 from trl import TrlParser
 from trl.import_utils import (
@@ -89,13 +90,14 @@ class WeightSyncWorkerExtension:
     """
     A vLLM worker extension that enables weight synchronization between a client and multiple server workers.
 
-    This worker uses a `StatelessProcessGroup` to establish communication and a `PyNcclCommunicator` to handle
-    efficient GPU-based communication using NCCL. The primary purpose of this class is to receive updated model weights
-    from a client process and distribute them to all worker processes participating in model inference.
+    This worker uses a `StatelessProcessGroup` to establish communication and a `PyNcclCommunicator` or
+    `ProcessGroupXCCL` to handle efficient GPU-based communication using NCCL. The primary purpose of this class is to
+    receive updated model weights from a client process and distribute them to all worker processes participating in
+    model inference.
     """
 
     # The following attributes are initialized when `init_communicator` method is called.
-    pynccl_comm = None  # Communicator for weight updates
+    communicator = None  # Communicator for weight updates
     client_rank = None  # Source rank for broadcasting updated weights
 
     def init_communicator(self, host: str, port: int, world_size: int, client_device_uuid: str) -> None:
@@ -115,23 +117,37 @@ class WeightSyncWorkerExtension:
             client_device_uuid (`str`):
                 UUID of the device of client main process. Used to assert that devices are different from vllm workers devices.
         """
-        if self.pynccl_comm is not None:
+        if self.communicator is not None:
             raise RuntimeError("Weight update group already initialized. Call close_communicator first.")
 
-        if client_device_uuid == str(torch.cuda.get_device_properties(self.device).uuid):
-            raise RuntimeError(
-                f"Attempting to use the same CUDA device (UUID: {client_device_uuid}) for multiple distinct "
-                "roles/ranks within the same communicator. This setup is unsupported and will likely lead to program "
-                "hangs or incorrect behavior. Ensure that trainer is using different devices than vLLM server."
-            )
+        # TODO: will remove after torch xpu 2.9 support uuid in get_device_properties
+        if torch.cuda.is_available() or (
+            is_torch_xpu_available() and hasattr(torch.xpu.get_device_properties(self.device), "uuid")
+        ):
+            accelerator_module = torch.xpu if is_torch_xpu_available() else torch.cuda
+            if client_device_uuid == str(accelerator_module.get_device_properties(self.device).uuid):
+                raise RuntimeError(
+                    f"Attempting to use the same CUDA device (UUID: {client_device_uuid}) for multiple distinct "
+                    "roles/ranks within the same communicator. This setup is unsupported and will likely lead to program "
+                    "hangs or incorrect behavior. Ensure that trainer is using different devices than vLLM server."
+                )
         # Get the rank of the current worker in the global world group.
         rank = get_world_group().rank
 
-        # Create a stateless process group to manage communication between training processes and vLLM workers.
-        pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
-
-        # Initialize the NCCL-based communicator for weight synchronization.
-        self.pynccl_comm = PyNcclCommunicator(pg, device=self.device)
+        if is_torch_xpu_available():
+            store = torch.distributed.TCPStore(host_name=host, port=port, world_size=world_size, is_master=(rank == 0))
+            prefixed_store = c10d.PrefixStore("client2server", store)
+            pg = c10d.ProcessGroupXCCL(
+                store=prefixed_store,
+                rank=rank,
+                size=world_size,
+            )
+            self.communicator = pg
+        else:
+            # Create a stateless process group to manage communication between training processes and vLLM workers.
+            # Initialize the NCCL-based communicator for weight synchronization.
+            pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
+            self.communicator = PyNcclCommunicator(pg, device=self.device)
 
         # The client process that sends updated weights has the highest rank (world_size - 1).
         self.client_rank = world_size - 1
@@ -148,16 +164,21 @@ class WeightSyncWorkerExtension:
             shape (`Sequence[int]`):
                 Shape of the weight tensor.
         """
-        if self.pynccl_comm is None:
+        if self.communicator is None:
             raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
 
         dtype = getattr(torch, dtype.split(".")[-1])
         # Allocate memory for the incoming weight tensor on the correct device.
         weight = torch.empty(shape, dtype=dtype, device=self.device)
 
-        # Use NCCL to broadcast the updated weights from the client (src) to all workers.
-        self.pynccl_comm.broadcast(weight, src=self.client_rank)
-        self.pynccl_comm.group.barrier()
+        if is_torch_xpu_available():
+            # Use XCCL to broadcast the updated weights from the client (src) to all workers.
+            self.communicator.broadcast(weight, root=self.client_rank)
+            self.communicator.barrier()
+        else:
+            # Use NCCL to broadcast the updated weights from the client (src) to all workers.
+            self.communicator.broadcast(weight, src=self.client_rank)
+            self.communicator.group.barrier()
 
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
@@ -169,9 +190,9 @@ class WeightSyncWorkerExtension:
         This method deletes the NCCL communicator to release associated resources.
         """
 
-        if self.pynccl_comm is not None:
-            del self.pynccl_comm
-            self.pynccl_comm = None  # Ensure attribute is reset to None
+        if self.communicator is not None:
+            del self.communicator
+            self.communicator = None  # Ensure attribute is reset to None
             self.client_rank = None  # Ensure attribute is reset to None
 
 
@@ -183,7 +204,7 @@ class ScriptArguments:
     Args:
         model (`str`):
             Model name or path to load the model from.
-        revision (`str` or `None`, *optional*, defaults to `None`):
+        revision (`str`, *optional*):
             Revision to use for the model. If not specified, the default branch will be used.
         tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Number of tensor parallel workers to use.
@@ -201,11 +222,11 @@ class ScriptArguments:
         dtype (`str`, *optional*, defaults to `"auto"`):
             Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
             based on the model configuration. Find the supported values in the vLLM documentation.
-        max_model_len (`int` or `None`, *optional*, defaults to `None`):
+        max_model_len (`int`, *optional*):
             If set, the `max_model_len` to use for vLLM. This can be useful when running with reduced
             `vllm_gpu_memory_utilization`, leading to a reduced KV cache size. If not set, vLLM will use the model
             context size, which might be much larger than the KV cache, leading to inefficiencies.
-        enable_prefix_caching (`bool` or `None`, *optional*, defaults to `None`):
+        enable_prefix_caching (`bool`, *optional*):
             Whether to enable prefix caching in vLLM. If set to `True`, ensure that the model and the hardware support
             this feature.
         enforce_eager (`bool`, *optional*, defaults to `False`):
@@ -493,6 +514,7 @@ def main(script_args: ScriptArguments):
         top_k: int = -1
         min_p: float = 0.0
         max_tokens: int = 16
+        truncate_prompt_tokens: Optional[int] = None
         guided_decoding_kwargs: Optional[dict] = None
         generation_kwargs: dict = field(default_factory=dict)
 
@@ -521,6 +543,9 @@ def main(script_args: ScriptArguments):
                 - `min_p` (`float`, *optional*, defaults to `0.0`): Minimum probability threshold for sampling.
                 - `max_tokens` (`int`, *optional*, defaults to `16`): Maximum number of tokens to generate for each
                   completion.
+                - `truncate_prompt_tokens` (`int`, *optional*): If set to `-1`, will use the truncation size supported
+                  by the model. If set to an integer k, will use only the last k tokens from the prompt (i.e., left
+                  truncation). If set to `None`, truncation is disabled.
                 - `guided_decoding_regex` (`str`, *optional*): A regex pattern for guided decoding. If provided, the
                   model will only generate tokens that match this regex pattern.
                 - `generation_kwargs` (`dict`, *optional*): Additional generation parameters to pass to the vLLM
@@ -529,6 +554,7 @@ def main(script_args: ScriptArguments):
 
         Returns:
             `GenerateResponse`:
+                - `prompt_ids` (list of list of `int`): A list of lists of token IDs for each input prompt.
                 - `completion_ids` (list of list of `int`): A list of lists of token IDs for each generated completion.
 
         Example request:
@@ -538,7 +564,11 @@ def main(script_args: ScriptArguments):
 
         Example response:
         ```json
-        {"completion_ids": [[101, 102, 103], [201, 202, 203]], "logprobs": [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]]}
+        {
+          "prompt_ids": [[101, 102], [201, 202]],
+          "completion_ids": [[103, 104, 105], [203, 204, 205]],
+          "logprobs": [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]]
+        }
         ```
         """
         start_time = time.time()
@@ -580,6 +610,7 @@ def main(script_args: ScriptArguments):
             "top_k": request.top_k,
             "min_p": request.min_p,
             "max_tokens": request.max_tokens,
+            "truncate_prompt_tokens": request.truncate_prompt_tokens,
             "guided_decoding": guided_decoding,
             # "prompt_logprobs": 20,
             "logprobs": 0,
@@ -622,8 +653,7 @@ def main(script_args: ScriptArguments):
 
         # Flatten and combine all results
         all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
-        # logger.info(str(all_outputs))
-
+        prompt_ids = [output.prompt_token_ids for output in all_outputs]
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
         logprobs: list[list[float]] = [
             [sanitize_logprob(next(iter(logprob.values()))) for logprob in output.logprobs]
@@ -653,7 +683,7 @@ def main(script_args: ScriptArguments):
         send_stuff_back_time = time.time()
         logger.warning(f"Sending stuff back, wallclock: {send_stuff_back_time:.3f}; delta: {send_stuff_back_time-recved_output_time:.3f}")
         
-        return {"basic": {"completion_ids": completion_ids, "logprobs": logprobs}, "extra": extra_stuff}
+        return {"basic": {"prompt_ids": prompt_ids, "completion_ids": completion_ids, "logprobs": logprobs}, "extra": extra_stuff}
 
     class InitCommunicatorRequest(BaseModel):
         host: str
@@ -742,7 +772,7 @@ def main(script_args: ScriptArguments):
     uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)
 
 
-def make_parser(subparsers: argparse._SubParsersAction = None):
+def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):
     if subparsers is not None:
         parser = subparsers.add_parser("vllm-serve", help="Run the vLLM serve script", dataclass_types=ScriptArguments)
     else:
