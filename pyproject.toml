@@ -27,9 +27,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13"
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
-    "accelerate>=1.4.0",
+    "accelerate>=1.11.0",
     "datasets>=3.0.0",
     "transformers>=4.56.1",
     "transformers!=4.57.0; python_version == '3.9'"
@@ -48,7 +48,7 @@ bco = [
     "joblib"
 ]
 deepspeed = [
-    "deepspeed>=0.14.4"
+    "deepspeed>=0.18.1"
 ]
 judges = [
     "openai>=1.23.2",
@@ -78,7 +78,7 @@ test = [
     "pytest"
 ]
 vllm = [
-    "vllm==0.10.2",
+    "vllm==0.11.0",
     "fastapi",
     "pydantic",
     "requests",
@@ -97,7 +97,7 @@ dev = [
     "scikit-learn",
     "joblib",
     # deepspeed
-    "deepspeed>=0.14.4",
+    "deepspeed>=0.18.0",
     # judges
     "openai>=1.23.2",
     "llm-blender>=0.0.2",
