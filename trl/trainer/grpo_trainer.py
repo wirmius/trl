@@ -1591,6 +1591,14 @@ class GRPOTrainer(BaseTrainer):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
             std_func_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_func_rewards)
+
+            # additionally append to dataset specific metric trackers if necessary
+            metric_key_prefixes = [inp.get('metric_key_prefix', None) for inp in inputs]
+            if metric_key_prefixes[0] is not None:
+                assert all([pref==metric_key_prefixes[0] for pref in metric_key_prefixes]), f"Encountered confusing prefixes within a batch, have to be the same! {metric_key_prefixes}"
+                # log the values appropriately
+                self._metrics[mode][f"rewards/{metric_key_prefixes[0]}{reward_func_name}/std"].append(std_func_rewards)
+                self._metrics[mode][f"rewards/{metric_key_prefixes[0]}{reward_func_name}/mean"].append(mean_rewards)
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
@@ -1840,7 +1848,8 @@ class GRPOTrainer(BaseTrainer):
         with torch.no_grad():
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
-            loss = loss.mean().detach()
+            if loss is not None:
+                loss = loss.mean().detach()
         return loss, None, None
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
