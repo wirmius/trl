@@ -279,7 +279,12 @@ class GRPOTrainer(BaseTrainer):
         tools: list[Callable] | None = None,
         rollout_func: RolloutFunc | None = None,
         environment_factory: EnvironmentFactory | None = None,
+        vllm_generation_base_class: Optional[Type] = None,
     ):
+        # SET THE BASE CLASSES TO DEFAULE
+        if vllm_generation_base_class is None and is_vllm_available():
+            vllm_generation_base_class = VLLMGeneration
+
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -706,7 +711,7 @@ class GRPOTrainer(BaseTrainer):
 
         if self.use_vllm:
             # Initialize vLLM generation backend
-            self.vllm_generation = VLLMGeneration(
+            self.vllm_generation = vllm_generation_base_class(
                 model=self.model,
                 accelerator=self.accelerator,
                 is_fsdp_enabled=self.is_fsdp_enabled,
@@ -1657,123 +1662,35 @@ class GRPOTrainer(BaseTrainer):
             extra_fields,
         )
 
-    def _generate_and_score_completions(
-        self, inputs: list[dict[str, torch.Tensor | Any]]
-    ) -> dict[str, torch.Tensor | Any]:
+
+    @torch.no_grad()
+    def _compute_and_log_importances(
+        self,
+        prompt_ids,
+        completion_ids,
+        prompt_mask, 
+        completion_mask,
+        sampling_per_token_logps_list = None,
+        forward_kwargs = {},
+        num_images = None
+    ):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
-        prompts = [x["prompt"] for x in inputs]
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
-        if self.environments:
-            for prompt, environment, reset_kwargs in zip(prompts, self.environments, inputs, strict=True):
-                observation = environment.reset(**reset_kwargs)
-                if observation is None:
-                    continue
-                prompt[-1]["content"] += observation
+        # extra stats
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
-        if "images" in inputs[0]:
-            images = [example.get("images") for example in inputs]
-        elif "image" in inputs[0]:
-            images = [[example.get("image")] if example.get("image") is not None else None for example in inputs]
-        else:
-            images = None
-        # Transformers requires at least one image in the batch, otherwise it throws an error
-        if images is not None and all(img_list == [] for img_list in images):
-            images = None
-
-        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
-        # [{"role": "user", "content": "What color is the sky?"}] to
-        # [{"role": "user", "content": [{"type": "image", "image": <Image>}, {"type": "text", "text": "What color is the sky?"}]}]
-        if images is not None:
-            if not is_conversational(inputs[0]):
-                raise ValueError(
-                    "Multimodal training requires conversational prompts. It looks like the dataset contains "
-                    "non-conversational inputs, likely because a chat template was applied before passing the dataset "
-                    "to the trainer. Please provide the raw conversational prompts and let the trainer apply the chat "
-                    "template internally."
-                )
-            prompts = [
-                prepare_multimodal_messages(prompt, image_list)
-                for prompt, image_list in zip(prompts, images, strict=True)
-            ]
-
-        (
-            prompt_ids_list,
-            completion_ids_list,
-            tool_mask_list,
-            completions,
-            num_items_in_batch,
-            sampling_per_token_logps_list,
-            extra_fields,
-        ) = self._generate(prompts)
-
-        # Convert lists of token IDs to padded tensors
-        prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
-        prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
-        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
-        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
-        completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
-        completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
-        completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
-        completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+        ## IF GIVEN - VLLM WAS USED, PAD THEM UP
         if sampling_per_token_logps_list is not None:
             sampling_per_token_logps = [torch.tensor(logps, device=device) for logps in sampling_per_token_logps_list]
             sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0, padding_side="right")
         else:
             sampling_per_token_logps = None
-        if tool_mask_list is not None:
-            tool_mask = [torch.tensor(mask, device=device) for mask in tool_mask_list]
-            tool_mask = pad(tool_mask, padding_value=1, padding_side="right")
-        else:
-            tool_mask = None
-
-        # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
-        if self.mask_truncated_completions:
-            eos_and_pad = [self.eos_token_id, self.pad_token_id]
-            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
-            # Mask completion_mask for attention masking
-            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
-            # Also mask tool_mask for consistency in multi-turn training
-            if tool_mask is not None:
-                tool_mask = tool_mask * (~is_truncated).unsqueeze(1).int()
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
-
-        num_images = [len(img_list) for img_list in images] if images is not None else None
-
-        # Get forward_kwargs for models with multimodal inputs
-        if images is not None:
-            prompts_text = [
-                apply_chat_template(
-                    {"prompt": prompt}, self.processing_class, tools=self.tools, **self.chat_template_kwargs
-                )["prompt"]
-                for prompt in prompts
-            ]
-            prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
-            prompt_inputs = super()._prepare_inputs(prompt_inputs)
-            forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
-        else:
-            forward_kwargs = {}
-
-        # If token_type_ids are used, extend them with zeros for the completion part
-        if "token_type_ids" in forward_kwargs:
-            token_type_ids = forward_kwargs["token_type_ids"]
-            forward_kwargs["token_type_ids"] = torch.cat(
-                [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
-            )
-        # If mm_token_type_ids are used, extend them with zeros for the completion part
-        if "mm_token_type_ids" in forward_kwargs:
-            mm_token_type_ids = forward_kwargs["mm_token_type_ids"]
-            forward_kwargs["mm_token_type_ids"] = torch.cat(
-                [mm_token_type_ids, mm_token_type_ids.new_zeros(completion_ids.shape)], dim=1
-            )
-
+        
         # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
         # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
         # Temporarily disable checkpointing to avoid this warning during inference.
@@ -1861,6 +1778,160 @@ class GRPOTrainer(BaseTrainer):
                         )
             else:
                 ref_per_token_logps = None
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
+            mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
+            delta = delta[mask]
+            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                self.accelerator.gather(mean_delta).mean().item()
+            )
+            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                self.accelerator.gather(max_delta).max().item()
+            )
+            if sequence_level_is:
+                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+            else:
+                flat_is_ratio = vllm_importance_sampling_ratio[mask]
+
+            min_importance_sampling_ratio = (
+                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            mean_importance_sampling_ratio = (
+                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            max_importance_sampling_ratio = (
+                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
+            )
+
+        return sampling_per_token_logps_list, importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
+
+
+    def _generate_and_score_completions(
+        self, 
+        inputs: list[dict[str, torch.Tensor | Any]],
+        compute_importances = True,
+    ) -> dict[str, torch.Tensor | Any]:
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+
+        prompts = [x["prompt"] for x in inputs]
+
+        if self.environments:
+            for prompt, environment, reset_kwargs in zip(prompts, self.environments, inputs, strict=True):
+                observation = environment.reset(**reset_kwargs)
+                if observation is None:
+                    continue
+                prompt[-1]["content"] += observation
+
+        if "images" in inputs[0]:
+            images = [example.get("images") for example in inputs]
+        elif "image" in inputs[0]:
+            images = [[example.get("image")] if example.get("image") is not None else None for example in inputs]
+        else:
+            images = None
+        # Transformers requires at least one image in the batch, otherwise it throws an error
+        if images is not None and all(img_list == [] for img_list in images):
+            images = None
+
+        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
+        # [{"role": "user", "content": "What color is the sky?"}] to
+        # [{"role": "user", "content": [{"type": "image", "image": <Image>}, {"type": "text", "text": "What color is the sky?"}]}]
+        if images is not None:
+            if not is_conversational(inputs[0]):
+                raise ValueError(
+                    "Multimodal training requires conversational prompts. It looks like the dataset contains "
+                    "non-conversational inputs, likely because a chat template was applied before passing the dataset "
+                    "to the trainer. Please provide the raw conversational prompts and let the trainer apply the chat "
+                    "template internally."
+                )
+            prompts = [
+                prepare_multimodal_messages(prompt, image_list)
+                for prompt, image_list in zip(prompts, images, strict=True)
+            ]
+
+        (
+            prompt_ids_list,
+            completion_ids_list,
+            tool_mask_list,
+            completions,
+            num_items_in_batch,
+            sampling_per_token_logps_list,
+            extra_fields,
+        ) = self._generate(prompts)
+
+        # Convert lists of token IDs to padded tensors
+        prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
+        prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in prompt_ids]
+        prompt_ids = pad(prompt_ids, padding_value=self.pad_token_id, padding_side="left")
+        prompt_mask = pad(prompt_mask, padding_value=0, padding_side="left")
+        completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+        completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in completion_ids]
+        completion_ids = pad(completion_ids, padding_value=self.pad_token_id, padding_side="right")
+        completion_mask = pad(completion_mask, padding_value=0, padding_side="right")
+
+        if tool_mask_list is not None:
+            tool_mask = [torch.tensor(mask, device=device) for mask in tool_mask_list]
+            tool_mask = pad(tool_mask, padding_value=1, padding_side="right")
+        else:
+            tool_mask = None
+
+        # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
+        if self.mask_truncated_completions:
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
+            # Mask completion_mask for attention masking
+            completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
+            # Also mask tool_mask for consistency in multi-turn training
+            if tool_mask is not None:
+                tool_mask = tool_mask * (~is_truncated).unsqueeze(1).int()
+
+        # Concatenate prompt_mask with completion_mask for logit computation
+        prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+
+        num_images = [len(img_list) for img_list in images] if images is not None else None
+
+        # Get forward_kwargs for models with multimodal inputs
+        if images is not None:
+            prompts_text = [
+                apply_chat_template(
+                    {"prompt": prompt}, self.processing_class, tools=self.tools, **self.chat_template_kwargs
+                )["prompt"]
+                for prompt in prompts
+            ]
+            prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
+            prompt_inputs = super()._prepare_inputs(prompt_inputs)
+            forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
+        else:
+            forward_kwargs = {}
+
+        # If token_type_ids are used, extend them with zeros for the completion part
+        if "token_type_ids" in forward_kwargs:
+            token_type_ids = forward_kwargs["token_type_ids"]
+            forward_kwargs["token_type_ids"] = torch.cat(
+                [token_type_ids, token_type_ids.new_zeros(completion_ids.shape)], dim=1
+            )
+        # If mm_token_type_ids are used, extend them with zeros for the completion part
+        if "mm_token_type_ids" in forward_kwargs:
+            mm_token_type_ids = forward_kwargs["mm_token_type_ids"]
+            forward_kwargs["mm_token_type_ids"] = torch.cat(
+                [mm_token_type_ids, mm_token_type_ids.new_zeros(completion_ids.shape)], dim=1
+            )
 
         # Decode
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
@@ -1955,42 +2026,6 @@ class GRPOTrainer(BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-            mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
-            delta = delta[mask]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
-            if sequence_level_is:
-                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-            else:
-                flat_is_ratio = vllm_importance_sampling_ratio[mask]
-
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
-
         output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1999,6 +2034,26 @@ class GRPOTrainer(BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
+
+        if compute_importances:
+            (
+                sampling_per_token_logps_list, vllm_importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
+            ) = self._compute_and_log_importances(
+                prompt_ids,
+                completion_ids,
+                prompt_mask, 
+                completion_mask,
+                sampling_per_token_logps_list = sampling_per_token_logps_list,
+                forward_kwargs = forward_kwargs,
+                num_images = num_images,
+            )
+        else:
+            # pass the per token logps to the output so that the importance sampling can be computed at a later point
+            output['sampling_per_token_logps_list'] = sampling_per_token_logps_list
+            output['forward_kwargs'] = forward_kwargs
+            vllm_importance_sampling_ratio, old_per_token_logps, ref_per_token_logps = None
+
+
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if self.use_vllm and self.vllm_importance_sampling_correction:
