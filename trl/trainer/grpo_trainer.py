@@ -1701,8 +1701,169 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields,
         )
 
+    def _compute_and_log_importances_from_generated_and_scored_output(
+        self,
+        generated_and_scored_output,
+    ):
+        assert 'forward_kwargs' in generated_and_scored_output, "The generated and scored outputs must contain forward_kwargs!"
+
+        prompt_completion_ids = torch.cat([generated_and_scored_output['prompt_ids'], generated_and_scored_output['completion_ids']], dim=1)  # (B, P+C)
+        attention_mask = torch.cat([generated_and_scored_output['prompt_mask'], generated_and_scored_output['completion_mask']], dim=1)  # (B, P+C)
+        logits_to_keep = generated_and_scored_output['completion_ids'].size(1)
+
+        return self._compute_and_log_importances(
+            prompt_completion_ids,
+            attention_mask,
+            logits_to_keep,
+            sampling_per_token_logps = generated_and_scored_output.get('sampling_per_token_logps', None),
+            forward_kwargs = generated_and_scored_output['forward_kwargs'],
+            num_images = generated_and_scored_output.get('num_images', None)
+        )
+
+    @torch.no_grad()
+    def _compute_and_log_importances(
+        self,
+        prompt_completion_ids,
+        attention_mask,
+        logits_to_keep,
+        sampling_per_token_logps = None,
+        forward_kwargs = {},
+        num_images = None
+    ):
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+
+        # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
+        # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
+        # Temporarily disable checkpointing to avoid this warning during inference.
+        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
+            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
+            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
+            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
+            # old_per_token_logps to None.
+            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
+            # distribution mismatch between vLLM and the training model can be large and harm the training.
+            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                self.use_vllm and self.vllm_importance_sampling_correction
+            ):
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    prompt_completion_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size,
+                    num_images=num_images,
+                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, pixel_position_ids
+                )
+            else:
+                old_per_token_logps = None
+
+            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+                per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
+
+                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                if sequence_level_is:
+                    per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                    logps_diff = per_sequence_logps_diff
+                else:
+                    logps_diff = per_token_logps_diff
+
+                vllm_importance_sampling_ratio = torch.exp(logps_diff)
+
+                # vllm_importance_sampling_ratio.shape:
+                #   token_* modes:     (B, T)  (per-token ratio)
+                #   sequence_* modes:  (B, 1)  (per-sequence ratio)
+
+                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    vllm_importance_sampling_ratio = torch.clamp(
+                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
+                    )
+                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
+                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                    )
+
+            # Compute the per-token log probabilities for the reference model
+            if self.beta != 0.0:
+                if self.ref_model is not None:
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, pixel_position_ids
+                    )
+                else:
+                    # When training a PEFT adapter, how we obtain the reference depends on the setup:
+                    # - New adapter: disabling adapters yields the base model.
+                    # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
+                    model = self.accelerator.unwrap_model(self.model)
+                    with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            batch_size=batch_size,
+                            num_images=num_images,
+                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, pixel_position_ids
+                        )
+            else:
+                ref_per_token_logps = None
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
+            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
+            mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
+            delta = delta[mask]
+            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+                self.accelerator.gather(mean_delta).mean().item()
+            )
+            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+                self.accelerator.gather(max_delta).max().item()
+            )
+            if sequence_level_is:
+                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+            else:
+                flat_is_ratio = vllm_importance_sampling_ratio[mask]
+
+            min_importance_sampling_ratio = (
+                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            mean_importance_sampling_ratio = (
+                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            max_importance_sampling_ratio = (
+                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
+            )
+            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
+            )
+
+        return importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
+
+
     def _generate_and_score_completions(
-        self, inputs: list[dict[str, torch.Tensor | Any]]
+        self, inputs: list[dict[str, torch.Tensor | Any]],
+        compute_importances = True,
     ) -> dict[str, torch.Tensor | Any]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
@@ -1806,8 +1967,6 @@ class GRPOTrainer(_BaseTrainer):
         # Concatenate prompt_mask with completion_mask for logit computation
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         num_images = [len(img_list) for img_list in images] if images is not None else None
@@ -1853,94 +2012,6 @@ class GRPOTrainer(_BaseTrainer):
             forward_kwargs["mm_token_type_ids"] = torch.cat(
                 [mm_token_type_ids, mm_token_type_ids.new_zeros(completion_ids.shape)], dim=1
             )
-
-        # When gradient checkpointing is enabled with use_reentrant=True (non default), calling the model inside a
-        # torch.no_grad() block triggers a harmless PyTorch warning ("None of the inputs have requires_grad=True").
-        # Temporarily disable checkpointing to avoid this warning during inference.
-        with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-            # distribution mismatch between vLLM and the training model can be large and harm the training.
-            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, pixel_position_ids
-                )
-            else:
-                old_per_token_logps = None
-
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
-                mask = completion_mask if tool_mask is None else completion_mask * tool_mask
-                per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
-
-                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                if sequence_level_is:
-                    per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                    logps_diff = per_sequence_logps_diff
-                else:
-                    logps_diff = per_token_logps_diff
-
-                vllm_importance_sampling_ratio = torch.exp(logps_diff)
-
-                # vllm_importance_sampling_ratio.shape:
-                #   token_* modes:     (B, T)  (per-token ratio)
-                #   sequence_* modes:  (B, 1)  (per-sequence ratio)
-
-                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                    vllm_importance_sampling_ratio = torch.clamp(
-                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                    )
-                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
-                    )
-                else:
-                    raise ValueError(
-                        f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
-                    )
-
-            # Compute the per-token log probabilities for the reference model
-            if self.beta != 0.0:
-                if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=batch_size,
-                        num_images=num_images,
-                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, pixel_position_ids
-                    )
-                else:
-                    # When training a PEFT adapter, how we obtain the reference depends on the setup:
-                    # - New adapter: disabling adapters yields the base model.
-                    # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
-                    model = self.accelerator.unwrap_model(self.model)
-                    with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
-                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            prompt_completion_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            batch_size=batch_size,
-                            num_images=num_images,
-                            **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, pixel_position_ids
-                        )
-            else:
-                ref_per_token_logps = None
 
         # Decode
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
@@ -2052,41 +2123,29 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
-            mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
-            delta = delta[mask]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
+        # Compute the importance coefficient, can be disabled if we don't want them just yet
+        if compute_importances:
+            logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+            (
+                importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
+            ) = self._compute_and_log_importances(
+                prompt_completion_ids,
+                attention_mask,
+                logits_to_keep,
+                sampling_per_token_logps = sampling_per_token_logps,
+                forward_kwargs = forward_kwargs,
+                num_images = num_images,
             )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
-            if sequence_level_is:
-                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-            else:
-                flat_is_ratio = vllm_importance_sampling_ratio[mask]
-
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
+            # fill out the output values appropriately
+            if old_per_token_logps is not None:
+                output["old_per_token_logps"] = old_per_token_logps
+            if ref_per_token_logps is not None:
+                output["ref_per_token_logps"] = ref_per_token_logps
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                output["importance_sampling_ratio"] = importance_sampling_ratio
+        else:
+            #  pass the forward kwargs into the output so that the complete info needed to recompute importances is there
+            output['forward_kwargs'] = forward_kwargs
 
         output = {
             "prompt_ids": prompt_ids,
