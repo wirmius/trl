@@ -1791,6 +1791,8 @@ class GRPOTrainer(_BaseTrainer):
                     raise ValueError(
                         f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
                     )
+            else:
+                vllm_importance_sampling_ratio = None
 
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
@@ -1858,7 +1860,7 @@ class GRPOTrainer(_BaseTrainer):
                 nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
             )
 
-        return importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
+        return vllm_importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
 
 
     def _generate_and_score_completions(
@@ -2123,11 +2125,20 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
+        output = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": advantages,
+            "num_items_in_batch": num_items_in_batch,
+        }
+
         # Compute the importance coefficient, can be disabled if we don't want them just yet
         if compute_importances:
             logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
             (
-                importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
+                vllm_importance_sampling_ratio, old_per_token_logps, ref_per_token_logps
             ) = self._compute_and_log_importances(
                 prompt_completion_ids,
                 attention_mask,
@@ -2142,27 +2153,13 @@ class GRPOTrainer(_BaseTrainer):
             if ref_per_token_logps is not None:
                 output["ref_per_token_logps"] = ref_per_token_logps
             if self.use_vllm and self.vllm_importance_sampling_correction:
-                output["importance_sampling_ratio"] = importance_sampling_ratio
+                output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
         else:
             #  pass the forward kwargs into the output so that the complete info needed to recompute importances is there
             output['forward_kwargs'] = forward_kwargs
 
-        output = {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "advantages": advantages,
-            "num_items_in_batch": num_items_in_batch,
-        }
-        if old_per_token_logps is not None:
-            output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
-        if ref_per_token_logps is not None:
-            output["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
             output["pixel_values"] = forward_kwargs["pixel_values"]
         if "image_grid_thw" in forward_kwargs:
